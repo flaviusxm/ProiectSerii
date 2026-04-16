@@ -10,7 +10,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.vector_ar.var_model import VAR
 from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
 from pmdarima import auto_arima
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error
 import warnings
 
 # ==========================================
@@ -22,145 +22,153 @@ sns.set_palette("tab10")
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
-# LISTA DE ȚĂRI PENTRU ANALIZĂ (Poți adăuga/șterge coduri Eurostat aici)
-TARGET_COUNTRIES = ['RO', 'DE', 'HU']
 OUTPUT_DIR = 'rezultate_analiza'
 
 def print_header(text):
     print(f"\n{'='*60}\n{text}\n{'='*60}")
 
 # ==========================================
-# 1. CURĂȚARE ȘI UNIFICARE DATE
+# 1. ÎNCĂRCARE ȘI PREGĂTIRE DATE (FRED)
 # ==========================================
 
-def get_isced_data(df, isced, name, geo):
-    subset = df[(df['geo'] == geo) &
-                (df['isced11'] == isced) & 
-                (df['age'] == 'Y25-64') & 
-                (df['sex'] == 'T') & 
-                (df['unit'] == 'PC')].copy()
+def load_macro_data():
+    print("Încărcare date FRED (CPI, Interest Rate, Oil Price)...")
     
-    if subset.empty:
-        return pd.DataFrame()
-        
-    subset['TIME_PERIOD'] = pd.to_datetime(subset['TIME_PERIOD'], format='%Y')
-    subset = subset.set_index('TIME_PERIOD').sort_index()
-    subset = subset[['OBS_VALUE']].rename(columns={'OBS_VALUE': name})
-    return subset[~subset.index.duplicated(keep='first')]
-
-def prepare_dataset(geo, full_df):
-    print(f"Pregătire date pentru: {geo}...")
-    
-    # 1. Tertiary: University Graduates (ED5-8)
-    # 2. Secondary: Upper Secondary (ED3_4)
-    # 3. Basic: Lower Secondary and below (ED0-2)
-    
-    df_tertiary = get_isced_data(full_df, 'ED5-8', 'Tertiary', geo)
-    df_secondary = get_isced_data(full_df, 'ED3_4', 'Secondary', geo)
-    df_basic = get_isced_data(full_df, 'ED0-2', 'Basic', geo)
-
-    if df_tertiary.empty or df_secondary.empty:
-        print(f"Eroare: Date insuficiente pentru {geo}.")
-        return pd.DataFrame()
-
-    # Unim datele
-    df_final = df_tertiary.join([df_secondary, df_basic], how='inner')
-    
-    # Tratare valori lipsă
-    if df_final.isnull().values.any():
-        df_final = df_final.interpolate(method='linear').ffill().bfill()
-
-    return df_final
-
-# ==========================================
-# 2. ANALIZĂ UNIVARIATĂ
-# ==========================================
-
-def run_univariate(df, geo, target_col='Tertiary'):
-    print(f"--- Analiză Univariată: {geo} ({target_col}) ---")
-    series = df[target_col]
-    
-    # A. Trend Visual
-    plt.figure(figsize=(10, 5))
-    plt.plot(series, marker='s', label=f'Observed ({geo})')
-    plt.title(f"Evoluția absolvenților ({target_col}) în {geo}")
-    plt.ylabel("% din populație")
-    plt.grid(True)
-    plt.savefig(os.path.join(OUTPUT_DIR, f'{geo}_01_trend.png'))
-    plt.close()
-    
-    # B. Split
-    horizon = 4
-    if len(series) < 10: return # Insuficient
-    train, test = series[:-horizon], series[-horizon:]
-
-    # C. Modele
     try:
-        model_hw = ExponentialSmoothing(train, trend='add', seasonal=None).fit()
+        df_cpi = pd.read_csv('CPIAUCSL.csv')
+        df_fed = pd.read_csv('FEDFUNDS.csv')
+        df_oil = pd.read_csv('POILWTIUSDM.csv')
+        
+        # Redenumire coloane pentru consistență
+        df_cpi.rename(columns={'observation_date': 'date', 'CPIAUCSL': 'CPI'}, inplace=True)
+        df_fed.rename(columns={'observation_date': 'date', 'FEDFUNDS': 'InterestRate'}, inplace=True)
+        df_oil.rename(columns={'observation_date': 'date', 'POILWTIUSDM': 'OilPrice'}, inplace=True)
+        
+        # Merge
+        df = pd.merge(df_cpi, df_fed, on='date', how='inner')
+        df = pd.merge(df, df_oil, on='date', how='inner')
+        
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+        
+        # TRANSFORMĂRI ECONOMETRICE
+        # 1. Inflație (Year-on-Year % Change)
+        df['Inflation'] = df['CPI'].pct_change(12) * 100
+        
+        # 2. Log Petrol (pentru stabilizarea varianței)
+        df['LogOil'] = np.log(df['OilPrice'])
+        
+        # Curățare NaNs de la pct_change
+        df.dropna(inplace=True)
+        
+        print(f"Date încărcate cu succes ({len(df)} observații lunare).")
+        return df[['Inflation', 'InterestRate', 'LogOil']]
+        
+    except Exception as e:
+        print(f"Eroare la încărcarea datelor: {e}")
+        return pd.DataFrame()
+
+# ==========================================
+# 2. ANALIZĂ UNIVARIATĂ (Inflație)
+# ==========================================
+
+def check_stationarity(series, name):
+    print(f"\n--- Test Staționaritate: {name} ---")
+    adf_res = adfuller(series)
+    print(f"ADF p-value: {adf_res[1]:.4f}")
+    kpss_res = kpss(series, regression='c')
+    print(f"KPSS p-value: {kpss_res[1]:.4f}")
+    return adf_res[1] < 0.05
+
+def run_univariate_inflation(df):
+    print_header("ANALIZĂ UNIVARIATĂ: INFLAȚIE")
+    series = df['Inflation']
+    
+    check_stationarity(series, 'Inflation')
+    
+    # Split
+    horizon = 12 # 1 an
+    train, test = series[:-horizon], series[-horizon:]
+    
+    print(f"Prognoză pentru {horizon} luni...")
+    
+    try:
+        # HW
+        model_hw = ExponentialSmoothing(train, trend='add', seasonal='add', seasonal_periods=12).fit()
         pred_hw = model_hw.forecast(horizon)
         
-        model_sarima = auto_arima(train, seasonal=False, error_action='ignore', suppress_warnings=True)
+        # SARIMA (Auto)
+        model_sarima = auto_arima(train, seasonal=True, m=12, suppress_warnings=True)
         pred_sarima, conf_int = model_sarima.predict(n_periods=horizon, return_conf_int=True)
-
-        # Calcul erori
-        rmse_hw = np.sqrt(mean_squared_error(test, pred_hw))
-        rmse_sarima = np.sqrt(mean_squared_error(test, pred_sarima))
-
-        # Diagnostic Reziduuri (Ljung-Box)
-        from statsmodels.stats.diagnostic import acorr_ljungbox
-        lb_test = acorr_ljungbox(model_sarima.resid(), lags=[10], return_df=True)
-        lb_p = lb_test['lb_pvalue'].values[0]
-        print(f"RMSE {geo}: HW={rmse_hw:.2f}, SARIMA={rmse_sarima:.2f}, Ljung-Box p-val={lb_p:.4f}")
-
-        # Plot Comparativ cu Intervale de Încredere
-        plt.figure(figsize=(11, 5))
-        plt.plot(train, label='Istoric (Train)')
-        plt.plot(test, label='Observed (Test)', color='black', linewidth=1.5)
-        plt.plot(test.index, pred_hw, 'r--', label='HW Forecast')
-        plt.plot(test.index, pred_sarima, 'g-', label='SARIMA Forecast')
         
-        # Interval de Încredere 95%
-        plt.fill_between(test.index, conf_int[:, 0], conf_int[:, 1], color='g', alpha=0.1, label='95% Conf. Interval')
-        
-        plt.title(f"Analiză Univariată {geo} - {target_col} (cu Interval de Încredere)")
+        # Plot
+        plt.figure(figsize=(12, 6))
+        plt.plot(train.index[-60:], train[-60:], label='Istoric Recent')
+        plt.plot(test.index, test, 'k--', label='Actual')
+        plt.plot(test.index, pred_hw, 'r', label='Holt-Winters')
+        plt.plot(test.index, pred_sarima, 'g', label='SARIMA')
+        plt.fill_between(test.index, conf_int[:, 0], conf_int[:, 1], color='g', alpha=0.1)
+        plt.title("Prognoza Ratei Inflației (YoY %)")
         plt.legend()
-        plt.savefig(os.path.join(OUTPUT_DIR, f'{geo}_02_forecast.png'))
+        plt.savefig(os.path.join(OUTPUT_DIR, '01_inflation_forecast.png'))
         plt.close()
-    except Exception as e:
-        print(f"Eroare analiză univariată {geo}: {e}")
-
-# ==========================================
-# 3. ANALIZĂ MULTIVARIATĂ
-# ==========================================
-
-def run_multivariate(df, geo):
-    print(f"--- Analiză Multivariată: {geo} ---")
-    data_mv = df[['Tertiary', 'Secondary']].copy()
-    if len(data_mv) < 15:
-        print(f"Date insuficiente (N={len(data_mv)}) pentru VAR în {geo}.")
-        return
-
-    # A. Test Cointegrare
-    try:
-        coint_res = coint_johansen(data_mv, det_order=0, k_ar_diff=1)
-        trace = coint_res.lr1[0]
-        crit = coint_res.cvt[0, 1]
         
-        if trace > crit:
-            model = VECM(data_mv, k_ar_diff=1, coint_rank=1).fit()
-        else:
-            model = VAR(data_mv.diff().dropna()).fit(maxlags=1)
-
-        # IRF
-        if hasattr(model, 'irf'):
-            irf = model.irf(periods=8)
-            irf.plot(orth=True)
-            plt.savefig(os.path.join(OUTPUT_DIR, f'{geo}_03_irf.png'))
-            plt.close()
-            
-        print(f"Analiză multivariată completă pentru {geo}.")
+        print(f"RMSE SARIMA: {np.sqrt(mean_squared_error(test, pred_sarima)):.4f}")
     except Exception as e:
-        print(f"Eroare VAR/VECM {geo}: {e}")
+        print(f"Eroare forecast univariat: {e}")
+
+# ==========================================
+# 3. ANALIZĂ MULTIVARIATĂ (Inflație, Petrol, Dobândă)
+# ==========================================
+
+def run_multivariate_analysis(df):
+    print_header("ANALIZĂ MULTIVARIATĂ: VECM / VAR")
+    
+    # Standardizare pentru comparabilitate în IRF
+    df_std = (df - df.mean()) / df.std()
+    
+    # A. Cointegrare (Johansen)
+    try:
+        coint = coint_johansen(df, det_order=0, k_ar_diff=1)
+        # Verificăm dacă există cel puțin o relație de cointegrare (Trace Statistic > Critical Value)
+        if coint.lr1[0] > coint.cvt[0, 1]:
+            print("Sistemul este COINTEGRAT. Estimăm modelul VECM...")
+            model_vecm = VECM(df_std, k_ar_diff=2, coint_rank=1).fit()
+        else:
+            print("Sistemul NU este cointegrat. Estimăm modelul VAR...")
+            model_vecm = None
+            
+        # Pentru IRF și FEVD folosim întotdeauna VAR pe date diferențiate
+        model = VAR(df_std.diff().dropna()).fit(maxlags=2)
+        
+        # Dacă sistemul e cointegrat, afișăm rezultatele VECM
+        if model_vecm is not None:
+            print("Rezultate VECM:")
+            print(model_vecm.summary())
+            
+        # IRF (Impulse Response Functions)
+        print("Generare Impulse Response (Efectul prețului petrolului asupra inflației)...")
+        irf = model.irf(24)
+        irf.plot(orth=True, impulse='LogOil', response='Inflation')
+        plt.savefig(os.path.join(OUTPUT_DIR, '02_irf_oil_inflation.png'))
+        plt.close()
+        
+        # Toate IRF-urile
+        irf.plot(orth=True)
+        plt.savefig(os.path.join(OUTPUT_DIR, '03_irf_all.png'))
+        plt.close()
+        
+        # FEVD (Variance Decomposition)
+        fevd = model.fevd(12)
+        fevd.plot()
+        plt.savefig(os.path.join(OUTPUT_DIR, '04_fevd.png'))
+        plt.close()
+        
+        print("Analiză multivariată finalizată cu succes.")
+        
+    except Exception as e:
+        print(f"Eroare în analiza multivariată: {e}")
 
 # ==========================================
 # EXECUȚIE
@@ -170,46 +178,11 @@ if __name__ == "__main__":
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         
-    print_header("MENIU ANALIZĂ MODULARĂ (SERII DE TIMP)")
+    data = load_macro_data()
     
-    file_path = 'edat_lfse_03_linear_2_0.csv'
-    if not os.path.exists(file_path):
-        print(f"Eroare: Lipsă fișier date {file_path}")
-        sys.exit(1)
+    if not data.empty:
+        run_univariate_inflation(data)
+        run_multivariate_analysis(data)
         
-    print("Încărcare bază de date Eurostat (poate dura câteva secunde)...")
-    full_dataset = pd.read_csv(file_path)
-
-    # Mini Meniu Interactiv
-    print("\nOpțiuni valabile:")
-    print("1. Introduceți codul unei țări (ex: RO, DE, FR, IT, HU)")
-    print("2. Introduceți 'EU' pentru Uniunea Europeană (EU27_2020)")
-    print("3. Introduceți 'ALL' pentru toate țările disponibile (Atenție: durează mult!)")
-    print("4. Introduceți mai multe coduri separate prin virgulă (ex: RO, DE)")
-    print("5. Apăsați ENTER pentru selecția implicită (RO, DE, HU)")
-    
-    user_input = input("\nAlegerile tale: ").strip().upper()
-    
-    if user_input == 'EU':
-        COUNTRIES_TO_PROCESS = ['EU27_2020']
-    elif user_input == 'ALL':
-        COUNTRIES_TO_PROCESS = sorted(full_dataset['geo'].unique().tolist())
-    elif ',' in user_input:
-        COUNTRIES_TO_PROCESS = [c.strip() for c in user_input.split(',')]
-    elif user_input != '':
-        COUNTRIES_TO_PROCESS = [user_input]
-    else:
-        COUNTRIES_TO_PROCESS = ['RO', 'DE', 'HU'] # Default set
-
-    for country in COUNTRIES_TO_PROCESS:
-        print_header(f"PROCESARE: {country}")
-        df_country = prepare_dataset(country, full_dataset)
-        
-        if not df_country.empty and len(df_country) >= 5:
-            run_univariate(df_country, country)
-            run_multivariate(df_country, country)
-        else:
-            print(f"Sărim peste {country} din cauza lipsei de date sau cod incorect.")
-
-    print_header("TOATE ANALIZELE AU FOST FINALIZATE")
-    print(f"Rezultatele se află în folderul: '{OUTPUT_DIR}'")
+    print_header("PROIECT FINALIZAT")
+    print(f"Rezultatele se află în: {OUTPUT_DIR}")
