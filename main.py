@@ -9,8 +9,10 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.vector_ar.var_model import VAR
 from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
+from statsmodels.stats.diagnostic import acorr_ljungbox
 from pmdarima import auto_arima
 from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
 import warnings
 
 # ==========================================
@@ -70,7 +72,34 @@ def load_macro_data():
         return pd.DataFrame()
 
 # ==========================================
-# 2. ANALIZĂ UNIVARIATĂ (Inflație)
+# 2. PUNCTUL 1: ANALIZA TRENDULUI (DETERMINIST VS STOCHASTIC)
+# ==========================================
+
+def analyze_trends(df):
+    print_header("CERINȚA 1: TREND DETERMINIST VS STOCHASTIC")
+    series = df['Inflation']
+    t = np.arange(len(series)).reshape(-1, 1)
+    
+    # 1. Trend Determinist (Liniar)
+    model_det = LinearRegression().fit(t, series)
+    trend_det = model_det.predict(t)
+    
+    # 2. Trend Stochastic (Random Walk cu Drift - aproximat prin diferențiere)
+    # Dacă seria e staționară după diferențiere, trendul e stochastic
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(series.index, series, label='Inflație Reală', alpha=0.5)
+    plt.plot(series.index, trend_det, 'r--', label='Trend Determinist (Liniar)')
+    plt.title("Analiza Trendului în Rata Inflației")
+    plt.legend()
+    plt.savefig(os.path.join(OUTPUT_DIR, '00_trend_analysis.png'))
+    plt.close()
+    
+    print("Interpretare: Dacă seria prezintă fluctuații persistente și nu revine rapid la o medie fixă,")
+    print("vorbim de un trend stochastic. Testele ADF/KPSS vor confirma acest lucru mai jos.")
+
+# ==========================================
+# 3. ANALIZĂ UNIVARIATĂ (Inflație)
 # ==========================================
 
 def check_stationarity(series, name):
@@ -102,6 +131,16 @@ def run_univariate_inflation(df):
         model_sarima = auto_arima(train, seasonal=True, m=12, suppress_warnings=True)
         pred_sarima, conf_int = model_sarima.predict(n_periods=horizon, return_conf_int=True)
         
+        # DIAGNOSTIC SARIMA
+        print("\n--- Diagnostic Model SARIMA ---")
+        residuals = model_sarima.resid()
+        lb_test = acorr_ljungbox(residuals, lags=[10], return_df=True)
+        print(f"Ljung-Box p-value (lag 10): {lb_test['lb_pvalue'].values[0]:.4f}")
+        if lb_test['lb_pvalue'].values[0] > 0.05:
+            print("Reziduuri albe (zgomot alb) - Model VALID.")
+        else:
+            print("Reziduuri autocorelate - Modelul ar putea fi îmbunătățit.")
+
         # Plot
         plt.figure(figsize=(12, 6))
         plt.plot(train.index[-60:], train[-60:], label='Istoric Recent')
@@ -114,7 +153,12 @@ def run_univariate_inflation(df):
         plt.savefig(os.path.join(OUTPUT_DIR, '01_inflation_forecast.png'))
         plt.close()
         
-        print(f"RMSE SARIMA: {np.sqrt(mean_squared_error(test, pred_sarima)):.4f}")
+        rmse_hw = np.sqrt(mean_squared_error(test, pred_hw))
+        rmse_sarima = np.sqrt(mean_squared_error(test, pred_sarima))
+        print(f"RMSE Holt-Winters: {rmse_hw:.4f}")
+        print(f"RMSE SARIMA: {rmse_sarima:.4f}")
+        print(f"Concluzie: Modelul {'SARIMA' if rmse_sarima < rmse_hw else 'HW'} este mai precis.")
+        
     except Exception as e:
         print(f"Eroare forecast univariat: {e}")
 
@@ -123,40 +167,40 @@ def run_univariate_inflation(df):
 # ==========================================
 
 def run_multivariate_analysis(df):
-    print_header("ANALIZĂ MULTIVARIATĂ: VECM / VAR")
+    print_header("ANALIZĂ MULTIVARIATĂ: VECM / VAR / GRANGER")
     
     # Standardizare pentru comparabilitate în IRF
     df_std = (df - df.mean()) / df.std()
     
-    # A. Cointegrare (Johansen)
+    # A. GRANGER CAUSALITY
+    print("\n--- Teste de Cauzalitate Granger (Lag 4) ---")
+    for col in ['InterestRate', 'LogOil']:
+        res = grangercausalitytests(df[['Inflation', col]], maxlag=4, verbose=False)
+        p_val = res[4][0]['ssr_ftest'][1]
+        print(f"Cauzalitate {col} -> Inflation: p-value = {p_val:.4f}")
+
+    # B. Cointegrare (Johansen)
     try:
         coint = coint_johansen(df, det_order=0, k_ar_diff=1)
-        # Verificăm dacă există cel puțin o relație de cointegrare (Trace Statistic > Critical Value)
         if coint.lr1[0] > coint.cvt[0, 1]:
-            print("Sistemul este COINTEGRAT. Estimăm modelul VECM...")
+            print("\nSistemul este COINTEGRAT (Trace Test > Critical Value).")
+            print("Există o relație stabilă pe termen lung între Inflație, Dobândă și Petrol.")
             model_vecm = VECM(df_std, k_ar_diff=2, coint_rank=1).fit()
+            print("\nRezultate VECM (Coeficienți de ajustare):")
+            print(model_vecm.alpha) # Viteza de ajustare
         else:
-            print("Sistemul NU este cointegrat. Estimăm modelul VAR...")
+            print("\nSistemul NU este cointegrat. Estimăm modelul VAR...")
             model_vecm = None
             
-        # Pentru IRF și FEVD folosim întotdeauna VAR pe date diferențiate
-        model = VAR(df_std.diff().dropna()).fit(maxlags=2)
+        # Pentru IRF și FEVD folosim VAR pe date diferențiate (staționare)
+        model = VAR(df_std.diff().dropna()).fit(maxlags=4)
         
-        # Dacă sistemul e cointegrat, afișăm rezultatele VECM
-        if model_vecm is not None:
-            print("Rezultate VECM:")
-            print(model_vecm.summary())
-            
         # IRF (Impulse Response Functions)
-        print("Generare Impulse Response (Efectul prețului petrolului asupra inflației)...")
+        print("\nGenerare Impulse Response...")
         irf = model.irf(24)
         irf.plot(orth=True, impulse='LogOil', response='Inflation')
+        plt.title("Răspunsul Inflației la un șoc în Prețul Petrolului")
         plt.savefig(os.path.join(OUTPUT_DIR, '02_irf_oil_inflation.png'))
-        plt.close()
-        
-        # Toate IRF-urile
-        irf.plot(orth=True)
-        plt.savefig(os.path.join(OUTPUT_DIR, '03_irf_all.png'))
         plt.close()
         
         # FEVD (Variance Decomposition)
@@ -165,7 +209,7 @@ def run_multivariate_analysis(df):
         plt.savefig(os.path.join(OUTPUT_DIR, '04_fevd.png'))
         plt.close()
         
-        print("Analiză multivariată finalizată cu succes.")
+        print("Analiză multivariată finalizată.")
         
     except Exception as e:
         print(f"Eroare în analiza multivariată: {e}")
@@ -181,6 +225,7 @@ if __name__ == "__main__":
     data = load_macro_data()
     
     if not data.empty:
+        analyze_trends(data)
         run_univariate_inflation(data)
         run_multivariate_analysis(data)
         
